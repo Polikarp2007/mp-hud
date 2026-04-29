@@ -19,6 +19,129 @@ import keyboard  # Добавь к остальным импортам
 from PyQt6 import QtCore
 import threading # Добавь это
 
+try:
+    import ctypes
+    import ctypes.wintypes
+    _user32 = ctypes.windll.user32
+    _WINDOWS = True
+except (AttributeError, OSError):
+    _WINDOWS = False
+
+# ── Station zone polygons (mirrored from map JS) ──────────────────────────────
+STATION_ZONES = {
+    "Arad":       [(46.19227,21.32248),(46.19301,21.32439),(46.18923,21.32760),(46.18848,21.32565)],
+    "Glogovat":   [(46.17633,21.41287),(46.17588,21.41276),(46.17728,21.39760),(46.17787,21.39776)],
+    "Ghioroc":    [(46.14953,21.58396),(46.14952,21.58338),(46.14762,21.58352),(46.14763,21.58419)],
+    "Paulis hc.": [(46.12058,21.58582),(46.12059,21.58637),(46.12240,21.58619),(46.12239,21.58575)],
+    "Paulis":     [(46.10721,21.61172),(46.10676,21.61175),(46.10662,21.60836),(46.10703,21.60840)],
+    "Radna":      [(46.09431,21.69036),(46.09342,21.69146),(46.09616,21.69554),(46.09705,21.69427)],
+}
+
+STATION_CENTERS = {
+    name: [sum(p[0] for p in poly)/len(poly), sum(p[1] for p in poly)/len(poly)]
+    for name, poly in STATION_ZONES.items()
+}
+
+ROUTE_ORDER = {
+    "Radna_Arad": ["Radna","Paulis","Paulis hc.","Ghioroc","Glogovat","Arad"],
+    "Arad_Radna": ["Arad","Glogovat","Ghioroc","Paulis hc.","Paulis","Radna"],
+}
+
+def _haversine(lat1, lon1, lat2, lon2):
+    R = 6371000
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def _point_in_polygon(lat, lon, polygon):
+    inside = False
+    n = len(polygon)
+    j = n - 1
+    for i in range(n):
+        lat1, lon1 = polygon[i]
+        lat2, lon2 = polygon[j]
+        if ((lat1 > lat) != (lat2 > lat)) and (lon < (lon2-lon1)*(lat-lat1)/(lat2-lat1)+lon1):
+            inside = not inside
+        j = i
+    return inside
+
+def _dist_to_polygon(lat, lon, polygon):
+    min_d = float('inf')
+    n = len(polygon)
+    for i in range(n):
+        j = (i + 1) % n
+        lat1, lon1 = polygon[i]
+        lat2, lon2 = polygon[j]
+        dx, dy = lat2-lat1, lon2-lon1
+        len2 = dx*dx + dy*dy
+        t = max(0, min(1, ((lat-lat1)*dx+(lon-lon1)*dy)/len2)) if len2 > 0 else 0
+        d = _haversine(lat, lon, lat1+t*dx, lon1+t*dy)
+        if d < min_d:
+            min_d = d
+    return min_d
+
+
+class StationTimeline(QWidget):
+    """Paints dots + connecting line segments for the station list."""
+
+    STATE_COLORS = {
+        'passed':  QColor(80, 80, 80),
+        'current': QColor(0xf1, 0xc4, 0x0f),   # yellow
+        'next':    QColor(0x00, 0xff, 0x44),    # green
+        'future':  QColor(255, 255, 255, 180),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.states = []
+        self.setFixedWidth(16)
+
+    def set_states(self, states):
+        self.states = states
+        self.update()
+
+    def paintEvent(self, event):
+        if not self.states:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        n = len(self.states)
+        h = max(self.height(), 1)
+        row_h = h / n
+        cx = self.width() // 2
+
+        for i, state in enumerate(self.states):
+            cy = int(i * row_h + row_h / 2)
+
+            # Line to next station
+            if i < n - 1:
+                cy_next = int((i+1) * row_h + row_h / 2)
+                nxt = self.states[i+1]
+                if state == 'passed' and nxt in ('next', 'current'):
+                    pen = QPen(QColor(0x00, 0xff, 0x44), 2)
+                    pen.setStyle(Qt.PenStyle.DashLine)
+                    pen.setDashPattern([4.0, 4.0])
+                elif state == 'passed':
+                    pen = QPen(QColor(80, 80, 80, 160), 2)
+                elif state in ('current', 'next'):
+                    pen = QPen(QColor(255, 255, 255, 50), 2)
+                else:
+                    pen = QPen(QColor(255, 255, 255, 50), 2)
+                painter.setPen(pen)
+                painter.drawLine(cx, cy + 5, cx, cy_next - 5)
+
+            # Dot
+            color = self.STATE_COLORS.get(state, QColor(255, 255, 255, 180))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(color))
+            r = 5 if state == 'current' else 4
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        painter.end()
+
+
 class Overlay(QWidget):
     key_signal = pyqtSignal(str) # Сигнал для связи потоков
 
@@ -525,7 +648,13 @@ class Overlay(QWidget):
         # --- ВОТ СЮДА ВСТАВЛЯЙ ---
         # Регистрируем глобальные нажатия (будут работать везде)
         import keyboard
-    
+
+        # Focus detection: show overlay only when RailWorks is in foreground
+        self._game_focused = True
+        self._focus_timer = QTimer(self)
+        self._focus_timer.timeout.connect(self._check_game_focus)
+        self._focus_timer.start(500)
+
 
     def show_task_widget(self):
         self.task_state = 0
@@ -828,16 +957,19 @@ class Overlay(QWidget):
         self.panel_layout.setContentsMargins(12, 10, 12, 4)
         self.panel_layout.setSpacing(5)
 
-        # Номер поезда (Динамический)
+        # Номер поезда (тип — красный, номер — синий)
         train_info_lay = QHBoxLayout()
         train_icon = get_svg_label("train.svg", 16)
-        self.train_num_label = QLabel("---")
-        self.train_num_label.setStyleSheet("color: #ffffff; font-family: 'Segoe UI'; font-size: 12px; font-weight: 800; border: none;")
+        self.train_type_label = QLabel("")
+        self.train_type_label.setStyleSheet("color: #cc1111; font-family: 'Segoe UI'; font-size: 12px; font-weight: 800; border: none;")
+        self.train_number_label = QLabel("---")
+        self.train_number_label.setStyleSheet("color: #3458e1; font-family: 'Segoe UI'; font-size: 12px; font-weight: 800; border: none;")
         train_info_lay.addWidget(train_icon)
-        train_info_lay.addWidget(self.train_num_label)
+        train_info_lay.addSpacing(4)
+        train_info_lay.addWidget(self.train_type_label)
+        train_info_lay.addSpacing(3)
+        train_info_lay.addWidget(self.train_number_label)
         train_info_lay.addStretch()
-        # ВСТАВЬ ЭТУ СТРОКУ НИЖЕ:
-        #train_info_lay.addWidget(QLabel("SIG 567m", styleSheet="color: #2ecc71; font-family: 'Segoe UI'; font-size: 11px; font-weight: 800; font-style: italic; border: none;"))
         self.panel_layout.addLayout(train_info_lay)
 
         # Маршрут (Динамический)
@@ -848,8 +980,9 @@ class Overlay(QWidget):
         route_info_lay.addWidget(route_icon)
         route_info_lay.addWidget(self.route_text_label)
         route_info_lay.addStretch()
-        # ВСТАВЬ ЭТУ СТРОКУ НИЖЕ:
-        route_info_lay.addWidget(QLabel("DST 102m", styleSheet="color: #ffffff; font-family: 'Segoe UI'; font-size: 11px; font-weight: 800; font-style: italic; border: none;"))
+        self.dst_label = QLabel("DST —")
+        self.dst_label.setStyleSheet("color: #ffffff; font-family: 'Segoe UI'; font-size: 11px; font-weight: 800; font-style: italic; border: none;")
+        route_info_lay.addWidget(self.dst_label)
         self.panel_layout.addLayout(route_info_lay)
 
         sep = QFrame(); sep.setFixedHeight(1)
@@ -1045,63 +1178,212 @@ class Overlay(QWidget):
 
     def refresh_timetable(self, data):
         from PyQt6 import QtCore
-        # Обновляем текст заголовков
-        self.train_num_label.setText(data.get("train_num", "R ----"))
+
+        # ── Train number (type red + number blue) ────────────────────────────
+        train_type = data.get("train_type", "")
+        train_number = data.get("train_number", "")
+        if not train_type and not train_number:
+            parts = data.get("train_num", "---").split(" ", 1)
+            train_type   = parts[0] if parts else ""
+            train_number = parts[1] if len(parts) > 1 else ""
+        self.train_type_label.setText(train_type)
+        self.train_number_label.setText(train_number)
         self.route_text_label.setText(data.get("route", "---"))
 
-        # Очищаем старую сетку
+        # ── GPS state ────────────────────────────────────────────────────────
+        lat        = data.get("lat", 0) or 0
+        lon        = data.get("lon", 0) or 0
+        route_from = data.get("route_from", "")
+        route_to   = data.get("route_to", "")
+        gps = self._get_station_state(lat, lon, route_from, route_to)
+
+        # ── DST / ON STATION label ───────────────────────────────────────────
+        if gps:
+            if gps["on_station"]:
+                self.dst_label.setText(f"ON ST.")
+                self.dst_label.setStyleSheet(
+                    "color: #f1c40f; font-family: 'Segoe UI'; font-size: 11px; font-weight: 800; font-style: italic; border: none;")
+            else:
+                self.dst_label.setText(f"DST {self._fmt_dist(gps['remaining'])}")
+                self.dst_label.setStyleSheet(
+                    "color: #ffffff; font-family: 'Segoe UI'; font-size: 11px; font-weight: 800; font-style: italic; border: none;")
+        else:
+            self.dst_label.setText("DST —")
+            self.dst_label.setStyleSheet(
+                "color: #ffffff; font-family: 'Segoe UI'; font-size: 11px; font-weight: 800; font-style: italic; border: none;")
+
+        # ── Clear grid ───────────────────────────────────────────────────────
         while self.tt_grid.count():
             item = self.tt_grid.takeAt(0)
             if item.widget(): item.widget().deleteLater()
 
         stations = data.get("stations", [])
-        if not stations: return
+        if not stations:
+            return
 
-        # ТА САМАЯ ЛИНИЯ
-        track_line = QFrame()
-        track_line.setFixedWidth(2)
-        track_line.setStyleSheet("""
-            background-color: rgba(255, 255, 255, 0.3); 
-            border: none;
-            margin-top: 12px; margin-bottom: 12px; 
-        """)
-        # Линия на всю высоту списка
-        self.tt_grid.addWidget(track_line, 0, 1, len(stations), 1, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        n = len(stations)
+        station_names = [s[0] for s in stations]
+        states = self._compute_station_states(station_names, gps)
+
+        # ── Timeline widget (column 1, spans all rows) ───────────────────────
+        timeline = StationTimeline()
+        timeline.set_states(states)
+        self.tt_grid.addWidget(timeline, 0, 1, n, 1, QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        t_style = "font-family: 'Segoe UI'; font-size: 10px; font-weight: 800;"
 
         for i, (name, arr, dep) in enumerate(stations):
-            # ВРЕМЯ
+            state = states[i]
+
+            # Colors per state
+            if state == 'passed':
+                name_css = "color: rgba(255,255,255,0.30);"
+                time_css = f"color: rgba(255,255,255,0.25); {t_style}"
+                dep_css  = f"color: rgba(255,255,255,0.15); {t_style}"
+            elif state == 'current':
+                name_css = "color: #f1c40f;"
+                time_css = f"color: #f1c40f; {t_style}"
+                dep_css  = f"color: rgba(241,196,15,0.6); {t_style}"
+            elif state == 'next':
+                name_css = "color: #00ff44;"
+                time_css = f"color: white; {t_style}"
+                dep_css  = f"color: rgba(255,255,255,0.4); {t_style}"
+            else:
+                name_css = "color: white;"
+                time_css = f"color: white; {t_style}"
+                dep_css  = f"color: rgba(255,255,255,0.4); {t_style}"
+
+            # Time container
             time_container = QWidget()
             time_v = QVBoxLayout(time_container)
-            time_v.setContentsMargins(0, 0, 0, 0); time_v.setSpacing(0)
-            
-            t_style = "font-family: 'Segoe UI'; font-size: 10px; font-weight: 800;"
-            a_l = QLabel(arr); a_l.setStyleSheet(f"color: white; {t_style}")
+            time_v.setContentsMargins(0, 0, 0, 0)
+            time_v.setSpacing(0)
+
+            a_l = QLabel(arr)
+            a_l.setStyleSheet(time_css)
             a_l.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            
-            d_l = QLabel(dep if dep != "--:--" else " ")
-            d_l.setStyleSheet(f"color: rgba(255, 255, 255, 0.4); {t_style}")
+
+            d_l = QLabel(dep if dep not in ("--:--", "") else " ")
+            d_l.setStyleSheet(dep_css)
             d_l.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            
-            time_v.addWidget(a_l); time_v.addWidget(d_l)
-            
-            # ТА САМАЯ ТОЧКА (8x8)
-            dot = QFrame()
-            dot.setFixedSize(8, 8)
-            dot.setStyleSheet("background: white; border-radius: 4px; border: 1px solid black;")
-            
-            # СТАНЦИЯ
+
+            time_v.addWidget(a_l)
+            time_v.addWidget(d_l)
+
+            # Station name (strikethrough if passed)
             st_l = QLabel(name)
-            st_l.setStyleSheet("color: white; font-family: 'Segoe UI'; font-size: 12px; font-weight: 800; border: none;")
+            decoration = "text-decoration: line-through;" if state == 'passed' else ""
+            st_l.setStyleSheet(
+                f"font-family: 'Segoe UI'; font-size: 12px; font-weight: 800; border: none; {name_css} {decoration}")
 
-            # Добавляем всё в сетку точь-в-точь
             self.tt_grid.addWidget(time_container, i, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
-            self.tt_grid.addWidget(dot, i, 1, QtCore.Qt.AlignmentFlag.AlignCenter)
-            self.tt_grid.addWidget(st_l, i, 2, QtCore.Qt.AlignmentFlag.AlignVCenter)
+            self.tt_grid.addWidget(st_l,           i, 2, QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-        # Фиксируем колонки
         self.tt_grid.setColumnStretch(0, 0)
         self.tt_grid.setColumnStretch(1, 0)
         self.tt_grid.setColumnStretch(2, 1)
+
+    # ── Station GPS helpers ───────────────────────────────────────────────────
+
+    def _get_current_zone(self, lat, lon):
+        for name, poly in STATION_ZONES.items():
+            if _point_in_polygon(lat, lon, poly):
+                return name
+        for name, poly in STATION_ZONES.items():
+            if _dist_to_polygon(lat, lon, poly) < 200:
+                return name
+        return None
+
+    def _get_station_state(self, lat, lon, route_from, route_to):
+        if not lat or not lon or not route_from or not route_to:
+            return None
+        key = f"{route_from}_{route_to}"
+        order = ROUTE_ORDER.get(key)
+        if not order:
+            return None
+
+        zone = self._get_current_zone(lat, lon)
+        if zone and zone in order:
+            idx = order.index(zone)
+            next_st = order[idx + 1] if idx < len(order) - 1 else order[-1]
+            remaining = _dist_to_polygon(lat, lon, STATION_ZONES[next_st]) if next_st in STATION_ZONES else 0
+            return {
+                "on_station":      True,
+                "current_station": zone,
+                "next_station":    next_st,
+                "remaining":       remaining,
+                "passed_stations": order[:idx],
+            }
+
+        # Between stations: project onto route
+        best_seg, min_d = 0, float('inf')
+        for i in range(len(order) - 1):
+            if order[i] not in STATION_CENTERS or order[i+1] not in STATION_CENTERS:
+                continue
+            p1 = STATION_CENTERS[order[i]]
+            p2 = STATION_CENTERS[order[i+1]]
+            dx, dy = p2[0]-p1[0], p2[1]-p1[1]
+            len2 = dx*dx + dy*dy
+            t = max(0, min(1, ((lat-p1[0])*dx+(lon-p1[1])*dy)/len2)) if len2 > 0 else 0
+            d = _haversine(lat, lon, p1[0]+t*dx, p1[1]+t*dy)
+            if d < min_d:
+                min_d = d
+                best_seg = i
+
+        next_st = order[best_seg + 1]
+        remaining = _dist_to_polygon(lat, lon, STATION_ZONES[next_st]) if next_st in STATION_ZONES else 0
+        return {
+            "on_station":      False,
+            "current_station": None,
+            "next_station":    next_st,
+            "remaining":       remaining,
+            "passed_stations": order[:best_seg + 1],
+        }
+
+    def _compute_station_states(self, station_names, gps):
+        states = ['future'] * len(station_names)
+        if not gps:
+            return states
+        passed  = set(gps.get("passed_stations", []))
+        current = gps.get("current_station")
+        nxt     = gps.get("next_station")
+        on_st   = gps.get("on_station", False)
+        for i, name in enumerate(station_names):
+            if name in passed:
+                states[i] = 'passed'
+            elif on_st and name == current:
+                states[i] = 'current'
+            elif not on_st and name == nxt:
+                states[i] = 'next'
+        return states
+
+    @staticmethod
+    def _fmt_dist(meters):
+        if meters >= 1000:
+            return f"{meters/1000:.1f} km"
+        return f"{round(meters)} m"
+
+    # ── Focus detection ───────────────────────────────────────────────────────
+
+    def _check_game_focus(self):
+        if not _WINDOWS:
+            return
+        try:
+            hwnd = _user32.GetForegroundWindow()
+            length = _user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            _user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+            focused = "RailWorks" in title or "Train Simulator" in title
+            if focused != self._game_focused:
+                self._game_focused = focused
+                if focused:
+                    self.show()
+                    self.raise_()
+                else:
+                    self.hide()
+        except Exception:
+            pass
 
 
 
@@ -1115,6 +1397,10 @@ class Overlay(QWidget):
         self.date_label.setText(now.toString("dd/MM/yyyy"))
 
 if __name__ == '__main__':
+    # Silent exit if not launched by the launcher
+    if not any(a.startswith('--key=') for a in sys.argv[1:]):
+        sys.exit(0)
+
     # ИСПРАВЛЕНИЕ: Вызываем политику ДО создания QApplication
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
