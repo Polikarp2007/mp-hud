@@ -55,6 +55,146 @@ class _KBDLLHOOKSTRUCT(ctypes.Structure):
 # Ключевые слова в заголовке окна — резервный способ определения игры
 _TARGET_TITLES = ('railwork', 'train simulator', 'railworks')
 
+# ── Station zones (polygons) — ported from map/index.html ────────────────────
+_STATION_ZONES = {
+    "Arad": [
+        [46.19227332454205, 21.32248424738745],
+        [46.19301401193828, 21.324388205110626],
+        [46.18923422322436, 21.327598183420765],
+        [46.18848259160333, 21.325647020134213],
+    ],
+    "Glogovat": [
+        [46.17632503773067, 21.41286866594898],
+        [46.17587872097718, 21.412763282715765],
+        [46.177276663699466, 21.397598172331335],
+        [46.17787005403529, 21.3977573902941],
+    ],
+    "Ghioroc": [
+        [46.14953315155513, 21.583959284909326],
+        [46.14952426668114, 21.58338643577958],
+        [46.147622870659816, 21.583523235571754],
+        [46.14763175584068, 21.58419013455863],
+    ],
+    "Paulis hc.": [
+        [46.12057633697037, 21.585819245867384],
+        [46.12059072849195, 21.58637464816498],
+        [46.12239683463942, 21.586192974484167],
+        [46.12238963911497, 21.585746576375815],
+    ],
+    "Paulis": [
+        [46.10720670033165, 21.61171666885639],
+        [46.106759001565614, 21.611751573576658],
+        [46.10661864120381, 21.608358834766346],
+        [46.107025201270154, 21.60840072043067],
+    ],
+    "Radna": [
+        [46.094307701095126, 21.690358858136978],
+        [46.09341778906679, 21.69145879292082],
+        [46.096164185499006, 21.695539362678925],
+        [46.09705137901734, 21.6942656080852],
+    ],
+}
+
+_STATION_CENTERS = {
+    name: [
+        sum(p[0] for p in poly) / len(poly),
+        sum(p[1] for p in poly) / len(poly),
+    ]
+    for name, poly in _STATION_ZONES.items()
+}
+
+_ROUTE_ORDER = {
+    "Radna_Arad": ["Radna", "Paulis", "Paulis hc.", "Ghioroc", "Glogovat", "Arad"],
+    "Arad_Radna": ["Arad", "Glogovat", "Ghioroc", "Paulis hc.", "Paulis", "Radna"],
+}
+
+
+def _haversine(lat1, lon1, lat2, lon2):
+    R = 6371000.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _point_in_polygon(lat, lon, polygon):
+    inside = False
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        lat_i, lon_i = polygon[i]
+        lat_j, lon_j = polygon[j]
+        if (lat_i > lat) != (lat_j > lat) and lon < (
+            (lon_j - lon_i) * (lat - lat_i) / (lat_j - lat_i) + lon_i
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _dist_to_polygon(lat, lon, polygon):
+    min_dist = float('inf')
+    n = len(polygon)
+    for i in range(n):
+        j = (i + 1) % n
+        lat1, lon1 = polygon[i]
+        lat2, lon2 = polygon[j]
+        dx, dy = lat2 - lat1, lon2 - lon1
+        len2 = dx * dx + dy * dy
+        t = max(0.0, min(1.0, ((lat - lat1) * dx + (lon - lon1) * dy) / len2)) if len2 > 0 else 0.0
+        d = _haversine(lat, lon, lat1 + t * dx, lon1 + t * dy)
+        if d < min_dist:
+            min_dist = d
+    return min_dist
+
+
+def _get_current_zone(lat, lon):
+    for name, poly in _STATION_ZONES.items():
+        if _point_in_polygon(lat, lon, poly):
+            return name
+    for name, poly in _STATION_ZONES.items():
+        if _dist_to_polygon(lat, lon, poly) < 200:
+            return name
+    return None
+
+
+def _get_gps_progress(lat, lon, route_from, route_to):
+    order = _ROUTE_ORDER.get(f"{route_from}_{route_to}")
+    if not order:
+        return None
+    current_zone = _get_current_zone(lat, lon)
+    if current_zone and current_zone in order:
+        idx = order.index(current_zone)
+        next_idx = idx + 1 if idx < len(order) - 1 else len(order) - 1
+        next_st = order[next_idx]
+        return {
+            'current_station': current_zone,
+            'next_station': next_st,
+            'on_station': True,
+            'remaining': _dist_to_polygon(lat, lon, _STATION_ZONES[next_st]),
+            'passed_idx': idx,
+            'order': order,
+        }
+    centers = [_STATION_CENTERS[s] for s in order]
+    best_seg, min_d = 0, float('inf')
+    for i in range(len(centers) - 1):
+        p1, p2 = centers[i], centers[i + 1]
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        len2 = dx * dx + dy * dy
+        t = max(0.0, min(1.0, ((lat - p1[0]) * dx + (lon - p1[1]) * dy) / len2)) if len2 > 0 else 0.0
+        d = _haversine(lat, lon, p1[0] + t * dx, p1[1] + t * dy)
+        if d < min_d:
+            min_d, best_seg = d, i
+    next_st = order[best_seg + 1]
+    return {
+        'current_station': None,
+        'next_station': next_st,
+        'on_station': False,
+        'remaining': _dist_to_polygon(lat, lon, _STATION_ZONES[next_st]),
+        'passed_idx': best_seg,
+        'order': order,
+    }
+
 def _fg_proc_name():
     """Возвращает (имя_процесса_нижний_регистр | None, hwnd) активного окна."""
     try:
@@ -559,7 +699,12 @@ class Overlay(QWidget):
         # === ВСТАВИТЬ В __init__ ===
         self.setup_chat_panel()
 
-
+        # Station blink timer (for current station orange blink)
+        self._current_station_label = None
+        self._station_blink_state = True
+        self._station_blink_timer = QTimer(self)
+        self._station_blink_timer.timeout.connect(self._blink_current_station)
+        self._station_blink_timer.start(400)
 
         # СОЗДАЕМ ОТДЕЛЬНУЮ ЛИНИЮ-НАКЛАДКУ
         self.top_line = QFrame(self)
@@ -1175,6 +1320,19 @@ class Overlay(QWidget):
 
 
 
+    def _blink_current_station(self):
+        lbl = getattr(self, '_current_station_label', None)
+        if lbl is None:
+            return
+        try:
+            self._station_blink_state = not self._station_blink_state
+            color = "#ff8800" if self._station_blink_state else "rgba(255, 136, 0, 0.15)"
+            lbl.setStyleSheet(
+                f"color: {color}; font-family: 'Segoe UI'; font-size: 12px; font-weight: 800; border: none;"
+            )
+        except RuntimeError:
+            self._current_station_label = None
+
     def fetch_data(self):
         try:
             # Твой рабочий IP и порт
@@ -1199,8 +1357,9 @@ class Overlay(QWidget):
 
     def refresh_timetable(self, data):
         from PyQt6 import QtCore
-        # Обновляем текст заголовков
         import re
+
+        # ── Header labels ─────────────────────────────────────────────────────
         train_num = data.get("train_num", "R ----")
         m = re.match(r'^([A-Za-z]+)\s*(\S.*)$', train_num)
         if m:
@@ -1211,6 +1370,7 @@ class Overlay(QWidget):
             )
         else:
             self.train_num_label.setText(f"<span style='color:#ffffff;'>{train_num}</span>")
+
         route = data.get("route", "---")
         parts = route.split(" to ", 1)
         if len(parts) == 2:
@@ -1222,56 +1382,146 @@ class Overlay(QWidget):
         else:
             self.route_text_label.setText(route)
 
-        # Очищаем старую сетку
+        # ── GPS progress ──────────────────────────────────────────────────────
+        lat = float(data.get("lat") or 0)
+        lon = float(data.get("lon") or 0)
+        route_from = data.get("route_from", "")
+        route_to = data.get("route_to", "")
+
+        gps = None
+        if lat and lon and route_from and route_to:
+            try:
+                gps = _get_gps_progress(lat, lon, route_from, route_to)
+            except Exception as e:
+                print(f"[HUD] GPS progress error: {e}")
+
+        # ── Distance label ────────────────────────────────────────────────────
+        if gps:
+            if gps['on_station']:
+                self.dst_label.setText("ON")
+                self.dst_label.setStyleSheet(
+                    "color: #ff8800; font-family: 'Segoe UI'; font-size: 11px;"
+                    " font-weight: 900; border: none; background: transparent;"
+                )
+            else:
+                rem = gps['remaining']
+                dist_str = f"{rem / 1000:.1f}km" if rem >= 1000 else f"{int(rem)}m"
+                self.dst_label.setText(dist_str)
+                self.dst_label.setStyleSheet(
+                    "color: #ffffff; font-family: 'Segoe UI'; font-size: 11px;"
+                    " font-weight: 900; border: none; background: transparent;"
+                )
+
+        # ── Station status helper ─────────────────────────────────────────────
+        def station_status(name):
+            if not gps:
+                return 'future'
+            order = gps['order']
+            if name not in order:
+                return 'future'
+            idx = order.index(name)
+            if gps['on_station'] and name == gps['current_station']:
+                return 'current'
+            if idx <= gps['passed_idx']:
+                return 'passed'
+            if name == gps['next_station']:
+                return 'next'
+            return 'future'
+
+        # ── Rebuild grid ──────────────────────────────────────────────────────
         while self.tt_grid.count():
             item = self.tt_grid.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
+            if item.widget():
+                item.widget().deleteLater()
+
+        self._current_station_label = None
 
         stations = data.get("stations", [])
-        if not stations: return
+        if not stations:
+            return
 
-        # ТА САМАЯ ЛИНИЯ
+        t_style = "font-family: 'Segoe UI'; font-size: 10px; font-weight: 800;"
+
+        # ТА САМАЯ ЛИНИЯ (unchanged — single frame spanning all rows)
         track_line = QFrame()
         track_line.setFixedWidth(2)
-        track_line.setStyleSheet("""
-            background-color: rgba(255, 255, 255, 0.3); 
-            border: none;
-            margin-top: 12px; margin-bottom: 12px; 
-        """)
-        # Линия на всю высоту списка
+        track_line.setStyleSheet(
+            "background-color: rgba(255, 255, 255, 0.3); border: none;"
+            " margin-top: 12px; margin-bottom: 12px;"
+        )
         self.tt_grid.addWidget(track_line, 0, 1, len(stations), 1, QtCore.Qt.AlignmentFlag.AlignHCenter)
 
         for i, (name, arr, dep) in enumerate(stations):
-            # ВРЕМЯ
+            status = station_status(name)
+
+            # ── Time column ───────────────────────────────────────────────────
             time_container = QWidget()
             time_v = QVBoxLayout(time_container)
-            time_v.setContentsMargins(0, 0, 0, 0); time_v.setSpacing(0)
-            
-            t_style = "font-family: 'Segoe UI'; font-size: 10px; font-weight: 800;"
-            a_l = QLabel(arr); a_l.setStyleSheet(f"color: white; {t_style}")
+            time_v.setContentsMargins(0, 0, 0, 0)
+            time_v.setSpacing(0)
+
+            if status == 'passed':
+                arr_color = "rgba(255, 255, 255, 0.25)"
+                dep_color = "rgba(255, 255, 255, 0.15)"
+            else:
+                arr_color = "white"
+                dep_color = "rgba(255, 255, 255, 0.4)"
+
+            a_l = QLabel(arr)
+            a_l.setStyleSheet(f"color: {arr_color}; {t_style}")
             a_l.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            
+
             d_l = QLabel(dep if dep != "--:--" else " ")
-            d_l.setStyleSheet(f"color: rgba(255, 255, 255, 0.4); {t_style}")
+            d_l.setStyleSheet(f"color: {dep_color}; {t_style}")
             d_l.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            
-            time_v.addWidget(a_l); time_v.addWidget(d_l)
-            
-            # ТА САМАЯ ТОЧКА (8x8)
+
+            time_v.addWidget(a_l)
+            time_v.addWidget(d_l)
+
+            # ── Dot ───────────────────────────────────────────────────────────
             dot = QFrame()
             dot.setFixedSize(8, 8)
-            dot.setStyleSheet("background: white; border-radius: 4px; border: 1px solid black;")
-            
-            # СТАНЦИЯ
-            st_l = QLabel(name)
-            st_l.setStyleSheet("color: white; font-family: 'Segoe UI'; font-size: 12px; font-weight: 800; border: none;")
+            if status == 'passed':
+                dot.setStyleSheet("background: rgba(255,255,255,0.25); border-radius: 4px; border: 1px solid black;")
+            elif status == 'current':
+                dot.setStyleSheet("background: #ff8800; border-radius: 4px; border: 1px solid black;")
+            elif status == 'next':
+                dot.setStyleSheet("background: #2ecc71; border-radius: 4px; border: 1px solid black;")
+            else:
+                dot.setStyleSheet("background: white; border-radius: 4px; border: 1px solid black;")
 
-            # Добавляем всё в сетку точь-в-точь
+            # ── Station name ──────────────────────────────────────────────────
+            st_l = QLabel(name)
+            if status == 'passed':
+                font = st_l.font()
+                font.setStrikeOut(True)
+                st_l.setFont(font)
+                st_l.setStyleSheet(
+                    "color: rgba(255,255,255,0.25); font-family: 'Segoe UI';"
+                    " font-size: 12px; font-weight: 800; border: none;"
+                )
+            elif status == 'current':
+                st_l.setStyleSheet(
+                    "color: #ff8800; font-family: 'Segoe UI';"
+                    " font-size: 12px; font-weight: 800; border: none;"
+                )
+                self._current_station_label = st_l
+                self._station_blink_state = True
+            elif status == 'next':
+                st_l.setStyleSheet(
+                    "color: #2ecc71; font-family: 'Segoe UI';"
+                    " font-size: 12px; font-weight: 800; border: none;"
+                )
+            else:
+                st_l.setStyleSheet(
+                    "color: white; font-family: 'Segoe UI';"
+                    " font-size: 12px; font-weight: 800; border: none;"
+                )
+
             self.tt_grid.addWidget(time_container, i, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
             self.tt_grid.addWidget(dot, i, 1, QtCore.Qt.AlignmentFlag.AlignCenter)
             self.tt_grid.addWidget(st_l, i, 2, QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-        # Фиксируем колонки
         self.tt_grid.setColumnStretch(0, 0)
         self.tt_grid.setColumnStretch(1, 0)
         self.tt_grid.setColumnStretch(2, 1)
