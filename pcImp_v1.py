@@ -932,16 +932,43 @@ class Overlay(QWidget):
     def fetch_steam_profile(self):
         def _worker():
             try:
-                steam_id = "76561199571446604"
-                url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
-                res = requests.get(url, timeout=5)
-                if res.status_code == 200:
-                    from xml.dom import minidom
-                    dom = minidom.parseString(res.text)
-                    name = dom.getElementsByTagName('steamID')[0].firstChild.data
-                    avatar_url = dom.getElementsByTagName('avatarMedium')[0].firstChild.data
-                    img_data = requests.get(avatar_url).content
-                    self._steam_update.emit(name, img_data)
+                # Parse --avatar-path, --steam-url, --user-name from launcher args
+                argv = sys.argv[1:]
+                avatar_path = None
+                steam_url = None
+                user_name = ""
+                i = 0
+                while i < len(argv):
+                    if argv[i] == "--avatar-path" and i + 1 < len(argv):
+                        avatar_path = argv[i + 1]; i += 2
+                    elif argv[i] == "--steam-url" and i + 1 < len(argv):
+                        steam_url = argv[i + 1]; i += 2
+                    elif argv[i] == "--user-name" and i + 1 < len(argv):
+                        user_name = argv[i + 1]; i += 2
+                    else:
+                        i += 1
+
+                # Prefer cached avatar file passed by launcher
+                if avatar_path and os.path.exists(avatar_path):
+                    with open(avatar_path, 'rb') as f:
+                        img_data = f.read()
+                    self._steam_update.emit(user_name, img_data)
+                    return
+
+                # Fall back: fetch from Steam using profile URL passed by launcher
+                if steam_url:
+                    url = steam_url.rstrip('/') + "/?xml=1"
+                    res = requests.get(url, timeout=5)
+                    if res.status_code == 200:
+                        from xml.dom import minidom
+                        dom = minidom.parseString(res.text)
+                        name_nodes = dom.getElementsByTagName('steamID')
+                        name = name_nodes[0].firstChild.data if name_nodes else user_name
+                        av_nodes = dom.getElementsByTagName('avatarMedium')
+                        if av_nodes:
+                            av_url = av_nodes[0].firstChild.data
+                            img_data = requests.get(av_url).content
+                            self._steam_update.emit(name, img_data)
             except Exception:
                 pass
         threading.Thread(target=_worker, daemon=True).start()
@@ -950,7 +977,8 @@ class Overlay(QWidget):
         pixmap = QPixmap()
         pixmap.loadFromData(img_data)
         self.avatar_label.setPixmap(pixmap)
-        self.nickname_label.setText(name.upper())
+        if name:
+            self.nickname_label.setText(name.upper())
 
 
     def setup_chat_panel(self):
