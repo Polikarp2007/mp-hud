@@ -930,32 +930,54 @@ class Overlay(QWidget):
             self.task_widget.setVisible(not self.task_widget.isVisible())
 
     def fetch_steam_profile(self):
+        def _find_avatar():
+            # 1. Try --avatar-path from launcher args
+            argv = sys.argv[1:]
+            for i in range(len(argv) - 1):
+                if argv[i] == "--avatar-path":
+                    p = argv[i + 1]
+                    if os.path.exists(p):
+                        return p, ""
+            # 2. Auto: HUD lives in Developer/, launcher base is one level up
+            try:
+                if getattr(sys, 'frozen', False):
+                    hud_dir = os.path.dirname(sys.executable)
+                else:
+                    hud_dir = os.path.dirname(os.path.abspath(__file__))
+                p = os.path.join(os.path.dirname(hud_dir), "Assets", "Dashboard", "steam_avatar.jpg")
+                if os.path.exists(p):
+                    return p, ""
+            except Exception:
+                pass
+            return None, None
+
+        def _get_user_name():
+            argv = sys.argv[1:]
+            for i in range(len(argv) - 1):
+                if argv[i] == "--user-name":
+                    return argv[i + 1]
+            return ""
+
+        def _get_steam_url():
+            argv = sys.argv[1:]
+            for i in range(len(argv) - 1):
+                if argv[i] == "--steam-url":
+                    return argv[i + 1]
+            return ""
+
         def _worker():
             try:
-                # Parse --avatar-path, --steam-url, --user-name from launcher args
-                argv = sys.argv[1:]
-                avatar_path = None
-                steam_url = None
-                user_name = ""
-                i = 0
-                while i < len(argv):
-                    if argv[i] == "--avatar-path" and i + 1 < len(argv):
-                        avatar_path = argv[i + 1]; i += 2
-                    elif argv[i] == "--steam-url" and i + 1 < len(argv):
-                        steam_url = argv[i + 1]; i += 2
-                    elif argv[i] == "--user-name" and i + 1 < len(argv):
-                        user_name = argv[i + 1]; i += 2
-                    else:
-                        i += 1
+                avatar_path, _ = _find_avatar()
+                user_name = _get_user_name()
 
-                # Prefer cached avatar file passed by launcher
-                if avatar_path and os.path.exists(avatar_path):
+                if avatar_path:
                     with open(avatar_path, 'rb') as f:
                         img_data = f.read()
                     self._steam_update.emit(user_name, img_data)
                     return
 
-                # Fall back: fetch from Steam using profile URL passed by launcher
+                # Fallback: fetch from Steam using URL arg
+                steam_url = _get_steam_url()
                 if steam_url:
                     url = steam_url.rstrip('/') + "/?xml=1"
                     res = requests.get(url, timeout=5)
@@ -966,8 +988,7 @@ class Overlay(QWidget):
                         name = name_nodes[0].firstChild.data if name_nodes else user_name
                         av_nodes = dom.getElementsByTagName('avatarMedium')
                         if av_nodes:
-                            av_url = av_nodes[0].firstChild.data
-                            img_data = requests.get(av_url).content
+                            img_data = requests.get(av_nodes[0].firstChild.data).content
                             self._steam_update.emit(name, img_data)
             except Exception:
                 pass
