@@ -930,66 +930,58 @@ class Overlay(QWidget):
             self.task_widget.setVisible(not self.task_widget.isVisible())
 
     def fetch_steam_profile(self):
-        def _find_avatar():
-            # 1. Try --avatar-path from launcher args
+        def _parse_arg(name):
             argv = sys.argv[1:]
             for i in range(len(argv) - 1):
-                if argv[i] == "--avatar-path":
-                    p = argv[i + 1]
-                    if os.path.exists(p):
-                        return p, ""
-            # 2. Auto: HUD lives in Developer/, launcher base is one level up
+                if argv[i] == name:
+                    return argv[i + 1]
+            return ""
+
+        def _find_local_avatar():
+            # Try --avatar-path arg first
+            p = _parse_arg("--avatar-path")
+            if p and os.path.exists(p):
+                return p
+            # Auto-detect: HUD is in Assets/PCIMP HUD/, avatar is in Assets/Dashboard/
             try:
                 if getattr(sys, 'frozen', False):
                     hud_dir = os.path.dirname(sys.executable)
                 else:
                     hud_dir = os.path.dirname(os.path.abspath(__file__))
-                p = os.path.join(os.path.dirname(hud_dir), "Assets", "Dashboard", "steam_avatar.jpg")
+                # hud_dir = .../Assets/PCIMP HUD  →  parent = .../Assets
+                p = os.path.join(os.path.dirname(hud_dir), "Dashboard", "steam_avatar.jpg")
                 if os.path.exists(p):
-                    return p, ""
+                    return p
             except Exception:
                 pass
-            return None, None
-
-        def _get_user_name():
-            argv = sys.argv[1:]
-            for i in range(len(argv) - 1):
-                if argv[i] == "--user-name":
-                    return argv[i + 1]
-            return ""
-
-        def _get_steam_url():
-            argv = sys.argv[1:]
-            for i in range(len(argv) - 1):
-                if argv[i] == "--steam-url":
-                    return argv[i + 1]
             return ""
 
         def _worker():
             try:
-                avatar_path, _ = _find_avatar()
-                user_name = _get_user_name()
+                steam_url = _parse_arg("--steam-url")
+                user_name = _parse_arg("--user-name")
 
-                if avatar_path:
-                    with open(avatar_path, 'rb') as f:
-                        img_data = f.read()
-                    self._steam_update.emit(user_name, img_data)
-                    return
-
-                # Fallback: fetch from Steam using URL arg
-                steam_url = _get_steam_url()
+                # Always try Steam first — gives real Steam nickname + fresh avatar
                 if steam_url:
                     url = steam_url.rstrip('/') + "/?xml=1"
-                    res = requests.get(url, timeout=5)
+                    res = requests.get(url, timeout=8)
                     if res.status_code == 200:
                         from xml.dom import minidom
                         dom = minidom.parseString(res.text)
                         name_nodes = dom.getElementsByTagName('steamID')
-                        name = name_nodes[0].firstChild.data if name_nodes else user_name
+                        steam_name = name_nodes[0].firstChild.data if name_nodes else user_name
                         av_nodes = dom.getElementsByTagName('avatarMedium')
                         if av_nodes:
-                            img_data = requests.get(av_nodes[0].firstChild.data).content
-                            self._steam_update.emit(name, img_data)
+                            img_data = requests.get(av_nodes[0].firstChild.data, timeout=8).content
+                            self._steam_update.emit(steam_name, img_data)
+                            return
+
+                # Fallback: local cached avatar file
+                local = _find_local_avatar()
+                if local:
+                    with open(local, 'rb') as f:
+                        img_data = f.read()
+                    self._steam_update.emit(user_name, img_data)
             except Exception:
                 pass
         threading.Thread(target=_worker, daemon=True).start()
